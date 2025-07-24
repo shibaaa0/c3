@@ -1,57 +1,144 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
-
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"os"
+	"path/filepath"
 )
 
 func main() {
+	// Tạo ứng dụng tview
 	app := tview.NewApplication()
 
-	rootDir, _ := os.Getwd()
-	root := tview.NewTreeNode(rootDir).SetReference(rootDir).SetExpanded(true)
-	tree := tview.NewTreeView().
-		SetRoot(root).
-		SetCurrentNode(root)
+	// Tạo TreeView để hiển thị tệp/thư mục
+	tree := tview.NewTreeView()
+	tree.SetBorder(true).SetTitle("File Manager")
 
-	// Đệ quy thêm node con
-	add := func(target *tview.TreeNode, path string) {
+	// Lấy thư mục hiện tại làm thư mục gốc
+	rootDir, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	root := tview.NewTreeNode(filepath.Base(rootDir)).
+		SetReference(rootDir).
+		SetColor(tcell.ColorBlue)
+	tree.SetRoot(root).SetCurrentNode(root)
+
+	// Hàm để tải danh sách tệp/thư mục
+	populateTree := func(node *tview.TreeNode) {
+		path := node.GetReference().(string)
 		files, err := os.ReadDir(path)
 		if err != nil {
 			return
 		}
 		for _, file := range files {
-			childPath := filepath.Join(path, file.Name())
-			node := tview.NewTreeNode(file.Name()).SetReference(childPath)
+			child := tview.NewTreeNode(file.Name()).
+				SetReference(filepath.Join(path, file.Name()))
 			if file.IsDir() {
-				node.SetColor(tcell.ColorGreen)
-				node.SetExpanded(false)
+				child.SetColor(tcell.ColorGreen).
+					SetSelectable(true)
 			}
-			target.AddChild(node)
+			node.AddChild(child)
 		}
 	}
 
-	// Lần đầu load thư mục root
-	add(root, rootDir)
+	// Tải thư mục gốc
+	populateTree(root)
 
+	// Xử lý sự kiện khi chọn node
 	tree.SetSelectedFunc(func(node *tview.TreeNode) {
-		path := node.GetReference().(string)
-		info, err := os.Stat(path)
+		reference := node.GetReference()
+		if reference == nil {
+			return
+		}
+		path := reference.(string)
+		fileInfo, err := os.Stat(path)
 		if err != nil {
 			return
 		}
-		if info.IsDir() {
-			if len(node.GetChildren()) == 0 {
-				add(node, path)
-			}
+		if fileInfo.IsDir() {
+			node.ClearChildren()
+			populateTree(node)
 			node.SetExpanded(!node.IsExpanded())
 		}
 	})
 
-	if err := app.SetRoot(tree, true).Run(); err != nil {
+	// Hàm hỗ trợ lấy tất cả node
+	getAllNodes := func(root *tview.TreeNode) []*tview.TreeNode {
+		var nodes []*tview.TreeNode
+		var walk func(*tview.TreeNode)
+		walk = func(node *tview.TreeNode) {
+			nodes = append(nodes, node)
+			for _, child := range node.GetChildren() {
+				if child.IsExpanded() {
+					walk(child)
+				}
+			}
+		}
+		walk(root)
+		return nodes
+	}
+
+	// Hàm hỗ trợ di chuyển xuống
+	getNextNode := func(current, root *tview.TreeNode) *tview.TreeNode {
+		if current == nil {
+			return root
+		}
+		nodes := getAllNodes(root)
+		for i, node := range nodes {
+			if node == current && i < len(nodes)-1 {
+				return nodes[i+1]
+			}
+		}
+		return current
+	}
+
+	// Hàm hỗ trợ di chuyển lên
+	getPreviousNode := func(current, root *tview.TreeNode) *tview.TreeNode {
+		if current == nil {
+			return root
+		}
+		nodes := getAllNodes(root)
+		for i, node := range nodes {
+			if node == current && i > 0 {
+				return nodes[i-1]
+			}
+		}
+		return current
+	}
+
+	// Thiết lập phím tắt
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'q': // Thoát ứng dụng
+				app.Stop()
+				return nil
+			case 'j': // Di chuyển xuống
+				current := tree.GetCurrentNode()
+				if current != nil {
+					tree.SetCurrentNode(getNextNode(current, tree.GetRoot()))
+				}
+				return nil
+			case 'k': // Di chuyển lên
+				current := tree.GetCurrentNode()
+				if current != nil {
+					tree.SetCurrentNode(getPreviousNode(current, tree.GetRoot()))
+				}
+				return nil
+			}
+		}
+		return event
+	})
+
+	// Tạo layout chính
+	flex := tview.NewFlex().
+		AddItem(tree, 0, 1, true)
+
+	// Chạy ứng dụng
+	if err := app.SetRoot(flex, true).EnableMouse(true).Run(); err != nil {
 		panic(err)
 	}
 }
