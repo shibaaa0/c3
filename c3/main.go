@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"mime"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -12,28 +16,28 @@ import (
 
 // FileManager holds the state of the c3 file manager
 type FileManager struct {
-	app         *tview.Application
-	list        *tview.List
-	preview     *tview.TextView
-	searchInput *tview.InputField
-	listFlex    *tview.Flex
-	currentDir  string
-	showHidden  bool
-	searchQuery string
+	app          *tview.Application
+	list         *tview.List
+	preview      *tview.TextView
+	searchInput  *tview.InputField
+	listFlex     *tview.Flex
+	currentDir   string
+	showHidden   bool
+	searchQuery  string
 	searchActive bool
 }
 
 // NewFileManager initializes a new file manager
 func NewFileManager() *FileManager {
 	fm := &FileManager{
-		app:         tview.NewApplication(),
-		list:        tview.NewList().ShowSecondaryText(false),
-		preview:     tview.NewTextView().SetText("Preview pane (to be implemented)").SetDynamicColors(true),
-		searchInput: tview.NewInputField().SetLabel("Search: "),
-		listFlex:    tview.NewFlex().SetDirection(tview.FlexRow),
-		currentDir:  getCurrentDir(),
-		showHidden:  false, // Hide hidden files by default
-		searchQuery: "",
+		app:          tview.NewApplication(),
+		list:         tview.NewList().ShowSecondaryText(false),
+		preview:      tview.NewTextView().SetText("Select a file or directory to preview").SetDynamicColors(true),
+		searchInput:  tview.NewInputField().SetLabel("Search: "),
+		listFlex:     tview.NewFlex().SetDirection(tview.FlexRow),
+		currentDir:   getCurrentDir(),
+		showHidden:   false, // Hide hidden files by default
+		searchQuery:  "",
 		searchActive: false,
 	}
 	// Initially only add list to listFlex
@@ -45,7 +49,7 @@ func NewFileManager() *FileManager {
 func getCurrentDir() string {
 	dir, err := os.Getwd()
 	if err != nil {
-		panic(err) // Simplify for Day 2; we'll handle errors later
+		panic(err) // Simplify for Day 3; we'll handle errors later
 	}
 	return dir
 }
@@ -78,11 +82,12 @@ func (fm *FileManager) updateFileList() {
 	dirEntries, err := os.ReadDir(fm.currentDir)
 	if err != nil {
 		fm.list.AddItem("[red]Error reading directory[-]", err.Error(), 0, nil)
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
 		return
 	}
 
-	// Sort entries: directories first, then files
-	var dirs, files []os.DirEntry
+	// Filter and sort entries: directories first, then files
+	var filteredEntries, dirs, files []os.DirEntry
 	for _, entry := range dirEntries {
 		if !fm.showHidden && strings.HasPrefix(entry.Name(), ".") {
 			continue // Skip hidden files if showHidden is false
@@ -99,16 +104,21 @@ func (fm *FileManager) updateFileList() {
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
 
-	// Add directories
+	// Build filteredEntries to match List order (dirs + files)
+	filteredEntries = append(filteredEntries, dirs...)
+	filteredEntries = append(filteredEntries, files...)
+
+	// Add directories to List
 	for _, dir := range dirs {
-		fm.list.AddItem("[blue]"+dir.Name()+"/[-]", "", 0, func() {
-			fm.navigateTo(dir.Name())
+		dirName := dir.Name() // Capture for closure
+		fm.list.AddItem("[blue]"+dirName+"/[-]", "", 0, func() {
+			fm.navigateTo(dirName)
 		})
 	}
 
-	// Add files
+	// Add files to List
 	for _, file := range files {
-		fm.list.AddItem("[white]"+file.Name()+"[-]", "", 0, nil) // No action for files yet
+		fm.list.AddItem("[white]"+file.Name()+"[-]", "", 0, nil) // No action for files
 	}
 
 	// Update list title with abbreviated path (last 2 directories)
@@ -125,6 +135,81 @@ func (fm *FileManager) updateFileList() {
 	hiddenStatus := "Hidden files: " + map[bool]string{true: "shown", false: "hidden"}[fm.showHidden]
 	searchStatus := "Search: " + map[string]string{"": "none", fm.searchQuery: fm.searchQuery}[fm.searchQuery]
 	fm.preview.SetText("Current directory: " + fm.currentDir + "\n" + hiddenStatus + "\n" + searchStatus)
+
+	// Update preview when selection changes
+	fm.list.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+		fm.updatePreview(index, filteredEntries)
+	})
+
+	// Trigger preview update for initial selection
+	if fm.list.GetItemCount() > 0 {
+		fm.updatePreview(fm.list.GetCurrentItem(), filteredEntries)
+	}
+}
+
+// updatePreview updates the preview pane based on selected item
+func (fm *FileManager) updatePreview(index int, filteredEntries []os.DirEntry) {
+	if index >= len(filteredEntries) || index < 0 {
+		fm.preview.SetText("Select a file or directory to preview")
+		return
+	}
+
+	entry := filteredEntries[index]
+	path := filepath.Join(fm.currentDir, entry.Name())
+	info, err := os.Stat(path)
+	if err != nil {
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
+		return
+	}
+
+	if entry.IsDir() {
+		// Preview directory contents
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			fm.preview.SetText("[red]Error reading directory: " + err.Error() + "[-]")
+			return
+		}
+		var previewLines []string
+		previewLines = append(previewLines, "[blue]Directory: "+entry.Name()+"[-]")
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() {
+				name += "/"
+			}
+			previewLines = append(previewLines, name)
+		}
+		fm.preview.SetText(strings.Join(previewLines, "\n"))
+	} else {
+		// Preview file
+		mimeType := mime.TypeByExtension(filepath.Ext(entry.Name()))
+		previewLines := []string{
+			"[white]File: " + entry.Name() + "[-]",
+			"Size: " + fmt.Sprintf("%d bytes", info.Size()),
+			"Modified: " + info.ModTime().Format(time.RFC1123),
+			"Permissions: " + info.Mode().String(),
+			"MIME: " + map[string]string{"": "unknown", mimeType: mimeType}[mimeType],
+		}
+
+		if strings.HasPrefix(mimeType, "text/") {
+			file, err := os.Open(path)
+			if err != nil {
+				previewLines = append(previewLines, "[red]Error reading file: "+err.Error()+"[-]")
+			} else {
+				defer file.Close()
+				scanner := bufio.NewScanner(file)
+				lineCount := 0
+				previewLines = append(previewLines, "--- Content (first 20 lines) ---")
+				for scanner.Scan() && lineCount < 20 {
+					previewLines = append(previewLines, scanner.Text())
+					lineCount++
+				}
+				if err := scanner.Err(); err != nil {
+					previewLines = append(previewLines, "[red]Error reading content: "+err.Error()+"[-]")
+				}
+			}
+		}
+		fm.preview.SetText(strings.Join(previewLines, "\n"))
+	}
 }
 
 // navigateTo changes to the specified directory
