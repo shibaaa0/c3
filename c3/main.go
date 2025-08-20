@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"io"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -21,10 +22,16 @@ type FileManager struct {
 	preview      *tview.TextView
 	searchInput  *tview.InputField
 	listFlex     *tview.Flex
+	renameInput  *tview.InputField
 	currentDir   string
 	showHidden   bool
 	searchQuery  string
 	searchActive bool
+	clipboardPath  string
+	clipboardIsCut bool
+	renameActive   bool
+	confirmModal   *tview.Modal
+	modalActive    bool
 }
 
 // NewFileManager initializes a new file manager
@@ -35,10 +42,14 @@ func NewFileManager() *FileManager {
 		preview:      tview.NewTextView().SetText("Select a file or directory to preview").SetDynamicColors(true),
 		searchInput:  tview.NewInputField().SetLabel("Search: "),
 		listFlex:     tview.NewFlex().SetDirection(tview.FlexRow),
+		renameInput:   tview.NewInputField().SetLabel("Rename to: "),
 		currentDir:   getCurrentDir(),
 		showHidden:   false, // Hide hidden files by default
 		searchQuery:  "",
 		searchActive: false,
+		renameActive:  false,
+		confirmModal:  tview.NewModal(),
+		modalActive:   false,
 	}
 	// Initially only add list to listFlex
 	fm.listFlex.AddItem(fm.list, 0, 1, true)
@@ -56,10 +67,11 @@ func getCurrentDir() string {
 
 // setupUI configures the TUI layout and starts the app
 func (fm *FileManager) setupUI() {
-	// Create main flex: listFlex on left, preview on right
+	// Create main flex: listFlex on left, preview on right, modal on top when active
 	flex := tview.NewFlex().
 		AddItem(fm.listFlex, 0, 1, true).
 		AddItem(fm.preview, 0, 1, false)
+	fm.app.SetRoot(fm.listFlex, true) // Initially set root to listFlex
 
 	// Style the list
 	fm.list.SetBorder(true).SetTitle("c3 - File Manager").SetTitleAlign(tview.AlignLeft)
@@ -230,17 +242,173 @@ func (fm *FileManager) navigateToParent() {
 	fm.navigateTo("..")
 }
 
+// copyFile copies a file from src to dst
+func (fm *FileManager) copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// Copy file permissions
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, info.Mode())
+}
+
+// copyDir recursively copies a directory from src to dst
+func (fm *FileManager) copyDir(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := fm.copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := fm.copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// paste performs paste operation for the clipboard content
+func (fm *FileManager) paste() {
+	if fm.clipboardPath == "" {
+		fm.preview.SetText("[red]Error: Nothing in clipboard[-]")
+		return
+	}
+
+	dstPath := filepath.Join(fm.currentDir, filepath.Base(fm.clipboardPath))
+	if _, err := os.Stat(dstPath); err == nil {
+		fm.preview.SetText("[red]Error: Destination already exists[-]")
+		return
+	}
+
+	info, err := os.Stat(fm.clipboardPath)
+	if err != nil {
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
+		return
+	}
+
+	if info.IsDir() {
+		err = fm.copyDir(fm.clipboardPath, dstPath)
+	} else {
+		err = fm.copyFile(fm.clipboardPath, dstPath)
+	}
+	if err != nil {
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
+		return
+	}
+
+	if fm.clipboardIsCut {
+		if err := os.RemoveAll(fm.clipboardPath); err != nil {
+			fm.preview.SetText("[red]Error removing source: " + err.Error() + "[-]")
+			return
+		}
+		fm.clipboardPath = ""
+		fm.clipboardIsCut = false
+	}
+
+	fm.preview.SetText("[green]Pasted: " + filepath.Base(dstPath) + "[-]")
+	fm.updateFileList()
+}
+
+// rename renames the selected file or directory
+func (fm *FileManager) rename(newName string) {
+	selected := fm.list.GetCurrentItem()
+	if selected >= fm.list.GetItemCount() {
+		fm.preview.SetText("[red]Error: No item selected[-]")
+		return
+	}
+	mainText, _ := fm.list.GetItemText(selected)
+	cleanText := strings.TrimPrefix(strings.TrimSuffix(mainText, "[-]"), "[blue]")
+	cleanText = strings.TrimPrefix(cleanText, "[white]")
+	if len(cleanText) == 0 {
+		fm.preview.SetText("[red]Error: Invalid selection[-]")
+		return
+	}
+	oldPath := filepath.Join(fm.currentDir, strings.TrimSuffix(cleanText, "/"))
+	newPath := filepath.Join(fm.currentDir, strings.TrimSpace(newName))
+	if _, err := os.Stat(newPath); err == nil {
+		fm.preview.SetText("[red]Error: Name already exists[-]")
+		return
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
+		return
+	}
+	fm.preview.SetText("[green]Renamed to: " + newName + "[-]")
+	fm.updateFileList()
+}
+
+// delete deletes the selected file or directory
+func (fm *FileManager) delete() {
+	selected := fm.list.GetCurrentItem()
+	if selected >= fm.list.GetItemCount() {
+		fm.preview.SetText("[red]Error: No item selected[-]")
+		return
+	}
+	mainText, _ := fm.list.GetItemText(selected)
+	cleanText := strings.TrimPrefix(strings.TrimSuffix(mainText, "[-]"), "[blue]")
+	cleanText = strings.TrimPrefix(cleanText, "[white]")
+	if len(cleanText) == 0 {
+		fm.preview.SetText("[red]Error: Invalid selection[-]")
+		return
+	}
+	path := filepath.Join(fm.currentDir, strings.TrimSuffix(cleanText, "/"))
+	if err := os.RemoveAll(path); err != nil {
+		fm.preview.SetText("[red]Error: " + err.Error() + "[-]")
+		return
+	}
+	fm.preview.SetText("[green]Deleted: " + filepath.Base(path) + "[-]")
+	fm.updateFileList()
+}
+
 // setupKeyBindings configures key bindings for navigation
 func (fm *FileManager) setupKeyBindings() {
 	fm.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		// If search is active, only allow specific keys to pass to app
-		if fm.searchActive {
+		// If modal is active, only allow specific keys to pass to modal
+		if fm.modalActive {
 			switch event.Key() {
-			case tcell.KeyEnter, tcell.KeyEscape:
-				// Handle in searchInput's DoneFunc
+			case tcell.KeyEnter, tcell.KeyTab, tcell.KeyBacktab, tcell.KeyLeft, tcell.KeyRight, tcell.KeyEscape:
 				return event
 			default:
-				// Let search input handle other keys
+				return nil
+			}
+		}
+		// If search or rename is active, only allow specific keys to pass to app
+		if fm.searchActive || fm.renameActive {
+			switch event.Key() {
+			case tcell.KeyEnter, tcell.KeyEscape:
+				// Handle in searchInput or renameInput's DoneFunc
+				return event
+			default:
+				// Let search or rename input handle other keys
 				return event
 			}
 		}
@@ -255,9 +423,61 @@ func (fm *FileManager) setupKeyBindings() {
 			if len(cleanText) > 0 && cleanText[len(cleanText)-1] == '/' {
 				fm.navigateTo(cleanText[:len(cleanText)-1])
 			}
-			return nil
+			return nil		
 		case tcell.KeyLeft:
 			fm.navigateToParent()
+			return nil
+		case tcell.KeyCtrlC:
+			selected := fm.list.GetCurrentItem()
+			if selected < fm.list.GetItemCount() {
+				mainText, _ := fm.list.GetItemText(selected)
+				cleanText := strings.TrimPrefix(strings.TrimSuffix(mainText, "[-]"), "[blue]")
+				cleanText = strings.TrimPrefix(cleanText, "[white]")
+				if len(cleanText) > 0 {
+					fm.clipboardPath = filepath.Join(fm.currentDir, strings.TrimSuffix(cleanText, "/"))
+					fm.clipboardIsCut = false
+					fm.preview.SetText("[green]Copied: " + filepath.Base(fm.clipboardPath) + "[-]")
+				}
+			}
+			return nil
+		case tcell.KeyCtrlX:
+			selected := fm.list.GetCurrentItem()
+			if selected < fm.list.GetItemCount() {
+				mainText, _ := fm.list.GetItemText(selected)
+				cleanText := strings.TrimPrefix(strings.TrimSuffix(mainText, "[-]"), "[blue]")
+				cleanText = strings.TrimPrefix(cleanText, "[white]")
+				if len(cleanText) > 0 {
+					fm.clipboardPath = filepath.Join(fm.currentDir, strings.TrimSuffix(cleanText, "/"))
+					fm.clipboardIsCut = true
+					fm.preview.SetText("[green]Cut: " + filepath.Base(fm.clipboardPath) + "[-]")
+				}
+			}
+			return nil
+		case tcell.KeyCtrlV:
+			fm.paste()
+			return nil
+		case tcell.KeyCtrlR:
+			selected := fm.list.GetCurrentItem()
+			if selected < fm.list.GetItemCount() {
+				fm.renameActive = true
+				fm.listFlex.AddItem(fm.renameInput, 1, 1, false)
+				fm.app.SetFocus(fm.renameInput)
+			}
+			return nil
+		case tcell.KeyCtrlD:
+			selected := fm.list.GetCurrentItem()
+			if selected < fm.list.GetItemCount() {
+				mainText, _ := fm.list.GetItemText(selected)
+				cleanText := strings.TrimPrefix(strings.TrimSuffix(mainText, "[-]"), "[blue]")
+				cleanText = strings.TrimPrefix(cleanText, "[white]")
+				fm.confirmModal.SetText("Confirm delete: " + cleanText + "?")
+				fm.modalActive = true
+				fm.app.SetRoot(tview.NewFlex().
+					AddItem(fm.listFlex, 0, 1, false).
+					AddItem(fm.preview, 0, 1, false).
+					AddItem(fm.confirmModal, 0, 0, true), true)
+				fm.app.SetFocus(fm.confirmModal)
+			}
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
@@ -298,6 +518,40 @@ func (fm *FileManager) setupKeyBindings() {
 		fm.searchQuery = strings.TrimSpace(text)
 		fm.updateFileList()
 	})
+
+	// Rename input key bindings
+	fm.renameInput.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			newName := strings.TrimSpace(fm.renameInput.GetText())
+			if newName != "" {
+				fm.rename(newName)
+			}
+			fm.renameActive = false
+			fm.listFlex.RemoveItem(fm.renameInput)
+			fm.renameInput.SetText("")
+			fm.app.SetFocus(fm.list)
+		} else if key == tcell.KeyEscape {
+			fm.renameActive = false
+			fm.listFlex.RemoveItem(fm.renameInput)
+			fm.renameInput.SetText("")
+			fm.app.SetFocus(fm.list)
+		}
+	})
+
+	// Configure confirm modal for delete
+	fm.confirmModal.SetText("Confirm delete?").
+		AddButtons([]string{"Yes", "No"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			fm.modalActive = false
+			fm.app.SetRoot(tview.NewFlex().
+				AddItem(fm.listFlex, 0, 1, true).
+				AddItem(fm.preview, 0, 1, false), true)
+			if buttonLabel == "Yes" {
+				fm.delete()
+			} else {
+				fm.preview.SetText("[yellow]Delete canceled[-]")
+			}
+		})
 }
 
 func main() {
