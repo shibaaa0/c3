@@ -33,7 +33,7 @@
 ```bash
 # Clone repository
 git clone https://github.com/shibaaa0/c3.git
-cd c3
+cd c3/app/
 
 # Cài dependencies
 go mod tidy
